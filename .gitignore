@@ -46,3 +46,6 @@ __MACOSX/
 
 # Output scratch
 *.tmp
+
+# Pipeline intermediates
+work/

@@ -1,6 +1,6 @@
 """End-to-end CLI.
 
-  python src/run.py --split train --stage all    # prep -> block -> train + validate
+  python src/run.py --split train --stage all    # prep -> block -> train -> stage2 (+ validate)
   python src/run.py --split test  --stage all    # prep -> block -> predict -> output/*.tsv
 
 Test predictions use the model and decision threshold learned on train. Countries unseen in
@@ -21,6 +21,7 @@ from config import OUTPUT_DIR, WORK_DIR, work_path
 from data_io import load_source, write_id_lists
 from features import add_global_context
 from prep import prep
+from stage2 import STAGE2_PATH, group_features, rescore
 from train import CHUNK_TARGETS, MODEL_PATH, featurize, predict
 
 UNSEEN_THRESHOLD = 0.6
@@ -55,9 +56,18 @@ def country_thresholds(pred: pl.DataFrame, base: float, seen: set[str]) -> dict[
 
 
 def write_outputs(split: str) -> None:
-    decision = json.loads((WORK_DIR / "decision.json").read_text())
     seen = set(pl.read_parquet(work_path("train", "s1.parquet"), columns=["country"])["country"].unique())
     pred = predict_split(split)
+    if STAGE2_PATH.exists():
+        # Group-aware re-scoring (stage2.py) with its own tuned decision rule.
+        p2 = work_path(split, "pred2.parquet")
+        if not p2.exists():
+            rescore(pred, group_features(pred, split), lgb.Booster(model_file=str(STAGE2_PATH))).write_parquet(p2)
+        pred = pl.read_parquet(p2)
+        decision = json.loads((WORK_DIR / "decision2.json").read_text())
+        print("[predict] using stage-2 scores")
+    else:
+        decision = json.loads((WORK_DIR / "decision.json").read_text())
     th = country_thresholds(pred, decision["threshold"], seen)
     matches = {}
     for c, t in th.items():
@@ -76,9 +86,10 @@ def write_outputs(split: str) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--split", choices=["train", "test"], required=True)
-    ap.add_argument("--stage", choices=["prep", "block", "train", "predict", "all"], default="all")
+    ap.add_argument("--stage", choices=["prep", "block", "train", "stage2", "predict", "all"], default="all")
     a = ap.parse_args()
-    stages = ["prep", "block", "train" if a.split == "train" else "predict"] if a.stage == "all" else [a.stage]
+    train_stages = ["prep", "block", "train", "stage2"]
+    stages = (train_stages if a.split == "train" else ["prep", "block", "predict"]) if a.stage == "all" else [a.stage]
     for st in stages:
         if st == "prep":
             prep(a.split)
@@ -88,6 +99,11 @@ def main() -> None:
         elif st == "train":
             from train import main as train_main
             train_main()
+        elif st == "stage2":
+            import stage2
+            if not work_path("train", "p1_oof.parquet").exists():
+                stage2.oof()
+            stage2.train()
         elif st == "predict":
             write_outputs(a.split)
 
