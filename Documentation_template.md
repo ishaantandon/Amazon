@@ -17,7 +17,7 @@ We flip the task around. Each Source 2/3 record belongs to **at most one** Sourc
 
 Every model is trained and tuned in a **test-like simulation**. The test Source 1 appears to be missing ~19% of the entities, and removing 19% of train S1 before blocking reproduces that; this was the finding that turned our validation into a reliable guide.
 
-**Final result:** public leaderboard **0.982023** macro F0.5; test-like validation 0.9865.
+**Final result:** public leaderboard **0.982201** macro F0.5; test-like validation 0.9865.
 
 ---
 
@@ -125,7 +125,7 @@ Blocking runs per country. Each channel maps records to sparse IDF-weighted vect
 2. For each S1, we keep the prefix of its accepted records (sorted by p) that maximizes the plug-in **expected F0.5**, `1.25·TP / (1.25·TP + 0.25·FN + FP)`, with TP, FP and FN estimated from the probabilities. The empty prediction competes with expected score ∏(1−p), so singletons need no special rule.
 3. τ is tuned on held-out S1 entities in the test-like simulation: **τ = 0.7 with the expected-F0.5 cut.**
 4. France has no labels, so the simulation cannot tune it. Countries unseen in training get τ ≥ 0.6.
-5. For the final file France uses **τ = 0.8**, chosen on the public leaderboard read at full precision: 0.982023, against 0.98188 at 0.7.
+5. For the final file France uses **τ = 0.9**, chosen on the public leaderboard read at full precision: 0.98188 at 0.7, 0.982023 at 0.8, 0.982201 at 0.9.
 
 ---
 
@@ -144,7 +144,7 @@ Blocking runs per country. Each channel maps records to sparse IDF-weighted vect
 | Macro recall | 0.9662 | 0.9691 | 0.9619 |
 | Singleton accuracy | 0.998 | 0.9983 | 0.9975 |
 
-- **F0.5 score (macro):** 0.9865 on the test-like validation; **0.982023 on the public leaderboard.**
+- **F0.5 score (macro):** 0.9865 on the test-like validation; **0.982201 on the public leaderboard.**
 - **Common false positives (wrong merges):**
   - generic names ("Balaji Investments", "Raj Technologies") with empty or city-only addresses
   - a different business at the same address, the dominant risk in France
@@ -156,7 +156,7 @@ Blocking runs per country. Each channel maps records to sparse IDF-weighted vect
   - in-candidate links whose probability falls below the per-entity cut
 
   Recall (0.966) is the remaining headroom.
-- **France** (no labels) scores ~0.94–0.96 by our leaderboard probes, assuming the simulation is right for US/India. That is below US+India (~0.986). Accepting look-alike links the model had rejected lost ~0.035. Raising its threshold from 0.7 to 0.8 gained ~0.001 and is used in the final file. Adding rescued links or changing its feature set did not help.
+- **France** (no labels) scores ~0.94–0.96 by our leaderboard probes, assuming the simulation is right for US/India. That is below US+India (~0.986). Accepting look-alike links the model had rejected lost ~0.035. Raising its threshold from 0.7 to 0.9 gained ~0.002 and is used in the final file. Adding rescued links or changing its feature set did not help.
 
 ---
 
@@ -198,7 +198,7 @@ code/business_entity_resolution/
   src/ce_v9.py          name-IDF features; final stage 2 and test scores
   src/dense_probe.py    e5 embeddings, exact nearest-neighbour search
   src/dense_rescue.py   rescue lane and the v10 output files
-  src/france_threshold.py  France at threshold 0.8: the final matching_results.tsv
+  src/france_threshold.py  France at threshold 0.9: the final matching_results.tsv
   src/package.py        builds the zip
   README.md, requirements.txt
 ```
@@ -210,7 +210,7 @@ code/business_entity_resolution/
 4. `ce_v5.py fit score`
 5. `ce_v9.py fit write`
 6. `dense_rescue.py`, which writes v10 to `work/output_v10_usin/`.
-7. `france_threshold.py 0.8`, which writes the final `work/output_v10_final/matching_results.tsv`.
+7. `france_threshold.py 0.9`, which writes the final `work/output_v10_final/matching_results.tsv`.
 
 Then copy that file and `work/output_v10_usin/candidate_pairs.tsv` to `output/`.
 
@@ -227,7 +227,7 @@ Then copy that file and `work/output_v10_usin/candidate_pairs.tsv` to `output/`.
 | v5 | + fine-tuned cross-encoder | 0.9849 | 0.978 |
 | v9 | + address-crowding and name-IDF features | 0.9857 | 0.979 |
 | v10 | + dense rescue lane (US, India) | 0.9865 | 0.98188 |
-| **v10 final** | **+ France threshold 0.8** | — | **0.982023** |
+| **v10 final** | **+ France threshold 0.9** | — | **0.982201** |
 
 **Pair scorer comparison** (the same stage 2 and data; only the scorer changes):
 

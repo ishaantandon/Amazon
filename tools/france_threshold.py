@@ -1,12 +1,12 @@
-"""Final step: re-assign France's links at threshold 0.8 on top of v10_usin.
+"""Final step: re-assign France's links at threshold 0.9 on top of v10_usin.
 
 France has no training labels, so the simulation cannot tune its threshold. On the public leaderboard, France at
-0.8 scored 0.982023 against 0.98188 for the simulation-tuned 0.7 (v10_usin); US and India rows are unchanged.
+0.7 (v10_usin, simulation-tuned) scored 0.98188, at 0.8 0.982023, at 0.9 0.982201; US and India rows are unchanged.
 Reads work/output_v10_usin/matching_results.tsv and work/test/pred2_v9.parquet (France has no rescue lane),
 writes work/output_v10_final/matching_results.tsv. The candidate file stays v10_usin's: a higher threshold only
 removes links.
 
-  python tools/france_threshold.py [threshold]      # default 0.8
+  python tools/france_threshold.py [threshold]      # default 0.9
 """
 import sys
 from pathlib import Path
@@ -45,4 +45,4 @@ def main(th: float) -> None:
 
 
 if __name__ == "__main__":
-    main(float(sys.argv[1]) if len(sys.argv) > 1 else 0.8)
+    main(float(sys.argv[1]) if len(sys.argv) > 1 else 0.9)

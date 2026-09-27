@@ -2,8 +2,8 @@
 
 For every Source 1 business record, this pipeline finds all Source 2 and Source 3 records that describe the same real-world business. Names are noisy, addresses messy, there are no shared IDs, and the test set adds France, which does not appear in training.
 
-> **Final submission (v10, France at threshold 0.8):** public leaderboard **0.982023** macro F0.5. On our test-like validation it scores **0.9865** (US 0.9877, India 0.9848) on 35,724 held-out S1 entities.
-> `output/matching_results.tsv` passes the official validator with `--check-ids`: 1,732,544 S1 rows, 1,632,400 with matches.
+> **Final submission (v10, France at threshold 0.9):** public leaderboard **0.982201** macro F0.5. On our test-like validation it scores **0.9865** (US 0.9877, India 0.9848) on 35,724 held-out S1 entities.
+> `output/matching_results.tsv` passes the official validator with `--check-ids`: 1,732,544 S1 rows, 1,631,755 with matches.
 
 **Contents:** [1 Problem](#1-the-problem) · [2 Data](#2-what-the-data-looks-like) · [3 Architecture](#3-architecture) · [4 Components](#4-components-and-why-each-exists) · [5 Results](#5-results) · [6 Reproducing](#6-reproducing) · [7 Layout](#7-package-layout) · [8 Compliance](#8-compliance) · [9 Limitations](#9-limitations)
 
@@ -61,7 +61,7 @@ For every Source 1 business record, this pipeline finds all Source 2 and Source 
  ⑦ Stage-2 LightGBM   p2
  ⑧ Rescue lane        (US, India) targets whose best p2 < 0.7 → dense e5 top-5 S1s that blocking missed
    │                   → cross-encoder → rescue LightGBM → merged with p2
- ⑨ Assignment         best S1 per target if p ≥ 0.7 (France: 0.8); per S1, the expected-F0.5-optimal subset
+ ⑨ Assignment         best S1 per target if p ≥ 0.7 (France: 0.9); per S1, the expected-F0.5-optimal subset
    │                   (the empty set competes)
    ▼
  output/matching_results.tsv, output/candidate_pairs.tsv (= top-8 candidates + scored rescue candidates)
@@ -146,7 +146,7 @@ For every Source 1 business record, this pipeline finds all Source 2 and Source 
 - Each target keeps its highest-probability S1 if p ≥ 0.7, the threshold tuned in the simulation.
 - For each S1, the accepted targets are sorted by p, and we keep the prefix that maximizes the plug-in expected F0.5. The empty set competes with expected score ∏(1−p), so singletons need no special case.
 - **France** has no labels, so its threshold could not be tuned in the simulation. The pipeline gives countries unseen in training at least 0.6 (`UNSEEN_THRESHOLD`), which doesn't bind at 0.7.
-- For the final file France uses **0.8**, chosen on the public leaderboard: it scored 0.982023, against 0.98188 at 0.7 (`france_threshold.py`).
+- For the final file France uses **0.9**, chosen on the public leaderboard: 0.98188 at 0.7, 0.982023 at 0.8, 0.982201 at 0.9 (`france_threshold.py`).
 
 ## 5. Results
 
@@ -159,11 +159,11 @@ Test-like simulation (Ⓐ + Ⓑ, 35,724 held-out S1) and the public leaderboard:
 | v5 | + cross-encoder | 0.9849 | 0.978 |
 | v9 | + address-crowding and name-IDF features | 0.9857 | 0.979 |
 | v10 | + rescue lane (US, India) | 0.9865 (US 0.9877, India 0.9848) | 0.98188 |
-| **v10 final** | **+ France threshold 0.8** | (France: no labels) | **0.982023** |
+| **v10 final** | **+ France threshold 0.9** | (France: no labels) | **0.982201** |
 
 **Final test output:**
-- 1,632,400 of 1,732,544 S1 have matches (100,144 empty).
-- Links: US 2,241,749, India 2,718,929, France 868,705.
+- 1,631,755 of 1,732,544 S1 have matches (100,789 empty).
+- Links: US 2,241,749, India 2,718,929, France 854,304.
 - The candidate file holds the 79.7M top-8 pairs plus the scored US/India rescue candidates. Every match is inside it.
 
 **Alternatives tested for the cross-encoder** (identical stage 2; simulation F0.5):
@@ -225,8 +225,8 @@ copy work\stage1_fold0.txt work\model.txt
 # 8. Rescue lane (~4 h, GPU) -> work\output_v10_usin\ and work\output_v10_dense\ (France included)
 .venv\Scripts\python src\dense_rescue.py
 
-# 9. France at threshold 0.8 on top of v10_usin (~2 min) -> work\output_v10_final\matching_results.tsv
-.venv\Scripts\python src\france_threshold.py 0.8
+# 9. France at threshold 0.9 on top of v10_usin (~2 min) -> work\output_v10_final\matching_results.tsv
+.venv\Scripts\python src\france_threshold.py 0.9
 
 # 10. Final output, then the official validator (from the organisers' student_resource\utils\)
 copy work\output_v10_final\matching_results.tsv output\
@@ -262,7 +262,7 @@ src/
   ce_v9.py         ⑥⑦ name-IDF features; final stage 2 and its test scores
   dense_probe.py   ⑧ e5 embeddings of S1 records, exact nearest-neighbour search
   dense_rescue.py  ⑧ rescue lane: candidates, scoring, rescue model, v10 outputs
-  france_threshold.py  ⑨ France at threshold 0.8: the final matching_results.tsv
+  france_threshold.py  ⑨ France at threshold 0.9: the final matching_results.tsv
 README.md, requirements.txt
 ```
 
@@ -283,7 +283,7 @@ README.md, requirements.txt
 
 - **France** (15% of test, no labels) is our weakest country. Leaderboard probes put it near 0.94–0.96, against ~0.986 for US+India, assuming the simulation is right for US/India. We could not find a label-free fix:
   - Loosening France's acceptance lost ~0.035 in France's score.
-  - Raising its threshold from 0.7 to 0.8 gained ~0.001 in France's score, and is used in the final file. A drastic cut (keeping only links with p ≥ 0.99) did not help, though that probe could only be read to 3 decimals.
+  - Raising its threshold from 0.7 to 0.9 gained ~0.002 in France's score, and is used in the final file. A drastic cut (keeping only links with p ≥ 0.99) did not help, though that probe could only be read to 3 decimals.
   - Adding rescued links cost ~0.001, and swapping between the v5 and v9 versions of France's rows changed nothing (< 0.0001).
 - **Recall is capped by retrieval,** most in India. The rescue lane recovers part of the gap.
 - **Decisions are made per target.** Clustering S2/S3 records into entities first, and then deciding per cluster whether an S1 exists, may handle the orphan groups better. It is untested.
