@@ -77,23 +77,26 @@ def evaluate(cands: pl.DataFrame, truth_all: dict, drop: pl.Series) -> None:
     nc = cands.filter(pl.col("tid").is_in(val_t.implode())).group_by("tid").len()["len"]
     print(f"[eval] val targets with <8 candidates: {(nc < 8).mean():.4f}", flush=True)
 
-    v1 = predict(lgb.Booster(model_file=str(WORK_DIR / "model_v1.txt")), featurize(cands, "train", val_t))
-    print("[eval] v2 = plain stage 1 (model_v1.txt); LB 0.952 at t=0.3, old simulation 0.9557:")
-    tune(v1, *ctx, out="_faithful_v2.json")
+    # Reference scores of earlier submissions; skipped on a fresh run where their models don't exist.
+    if (WORK_DIR / "model_v1.txt").exists():
+        v1 = predict(lgb.Booster(model_file=str(WORK_DIR / "model_v1.txt")), featurize(cands, "train", val_t))
+        print("[eval] v2 = plain stage 1 (model_v1.txt); LB 0.952 at t=0.3, old simulation 0.9557:")
+        tune(v1, *ctx, out="_faithful_v2.json")
 
     pred = pl.read_parquet(P1)
     vp = pred.filter(pl.col("tid").is_in(val_t.implode()))
     print("[eval] test-like stage 1 (fold models); old simulation 0.9605 at t=0.6:")
     tune(vp, *ctx, out="_faithful_s1.json")
 
-    orig_norm = stage2._norm
-    stage2._norm = lambda split: (lambda s, t: (s.filter(~pl.col("entity_id").is_in(drop.implode())), t))(*orig_norm(split))
-    feats = stage2.group_features(pred, "train")
-    stage2._norm = orig_norm
-    v4 = stage2.rescore(vp, feats.filter(pl.col("tid").is_in(val_t.implode())),
-                        lgb.Booster(model_file=str(WORK_DIR / "stage2_v4.txt")))
-    print("[eval] v4 = stage 2 (stage2_v4.txt); LB 0.955 at t=0.4, old simulation 0.9699:")
-    tune(v4, *ctx, out="_faithful_v4.json")
+    if (WORK_DIR / "stage2_v4.txt").exists():
+        orig_norm = stage2._norm
+        stage2._norm = lambda split: (lambda s, t: (s.filter(~pl.col("entity_id").is_in(drop.implode())), t))(*orig_norm(split))
+        feats = stage2.group_features(pred, "train")
+        stage2._norm = orig_norm
+        v4 = stage2.rescore(vp, feats.filter(pl.col("tid").is_in(val_t.implode())),
+                            lgb.Booster(model_file=str(WORK_DIR / "stage2_v4.txt")))
+        print("[eval] v4 = stage 2 (stage2_v4.txt); LB 0.955 at t=0.4, old simulation 0.9699:")
+        tune(v4, *ctx, out="_faithful_v4.json")
     for f in ("_faithful_v2.json", "_faithful_s1.json", "_faithful_v4.json"):
         (WORK_DIR / f).unlink(missing_ok=True)
 

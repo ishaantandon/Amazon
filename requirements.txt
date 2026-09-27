@@ -1,10 +1,16 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
 anyascii==0.3.3
+huggingface_hub==1.33.0
 lightgbm==4.7.0
 numpy==2.5.3
 polars==1.44.2
 polars-runtime-32==1.44.2
 pyarrow==25.0.1
 RapidFuzz==3.14.6
+safetensors==0.8.0
 scikit-learn==1.9.1
 scipy==1.18.1
 sparse-dot-topn==1.2.0
+tokenizers==0.23.2
+torch==2.11.0+cu128
+transformers==5.17.0

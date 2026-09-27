@@ -1,393 +1,282 @@
 # Business Entity Resolution — Amazon ML Challenge 2026 (team **aid**)
 
-This pipeline finds, for every Source 1 business record, all the Source 2 and Source 3 records that describe the same real-world business. The inputs are noisy names, messy addresses and no shared IDs, across US, India and France (France appears only in the test set).
+For every Source 1 business record, this pipeline finds all Source 2 and Source 3 records that describe the same real-world business. Names are noisy, addresses messy, there are no shared IDs, and the test set adds France, which does not appear in training.
 
-> **Validation macro F0.5: 0.9624** (US 0.966, India 0.957), measured on 43,948 held-out S1 entities at full candidate density. Precision is 0.980, recall 0.924.
-> **Test submission:** `output/matching_results.tsv` passes the official validator (with `--check-ids`), and the final package is `aid_submission.zip`. The leaderboard score comes from the portal after upload.
+> **Final submission (v10):** public leaderboard **0.98188** macro F0.5. On our test-like validation it scores **0.9865** (US 0.9877, India 0.9848) on 35,724 held-out S1 entities.
+> `output/matching_results.tsv` passes the official validator with `--check-ids`: 1,732,544 S1 rows, 1,632,759 with matches.
 
-**Contents:**
-1. [The problem](#1-the-problem)
-2. [What the data looks like](#2-what-the-data-actually-looks-like)
-3. [The approach](#3-the-approach)
-4. [Why this design](#4-why-this-design)
-5. [Results](#5-results)
-6. [Reproducing](#6-reproducing)
-7. [Submitting](#7-submitting)
-8. [Repository layout](#8-repository-layout)
-9. [Compliance](#9-compliance)
-10. [Limitations and next steps](#10-limitations-and-next-steps)
+**Contents:** [1 Problem](#1-the-problem) · [2 Data](#2-what-the-data-looks-like) · [3 Architecture](#3-architecture) · [4 Components](#4-components-and-why-each-exists) · [5 Results](#5-results) · [6 Reproducing](#6-reproducing) · [7 Layout](#7-package-layout) · [8 Compliance](#8-compliance) · [9 Limitations](#9-limitations)
 
 ---
 
 ## 1. The problem
 
-There are three sources of business records, each with `entity_id`, `business_name`, `business_address` and `country`.
+- **Source 1 (S1)** is the deduplicated reference. **Sources 2 and 3 (S2, S3)** hold noisy copies of those businesses plus unrelated records. Each record has `entity_id`, `business_name`, `business_address` and `country`.
+- For each S1 entity we output the list of matching S2/S3 IDs, which may be empty.
+- **Metric: macro F0.5**, computed per S1 entity and averaged over all S1 entities. Precision counts twice as much as recall. An entity with matches scores 0 if we predict nothing, and a true singleton scores 1 only if we predict nothing.
 
-- **Source 1 (S1)** is the deduplicated reference.
-- **Sources 2 and 3 (S2, S3)** hold noisy copies of those businesses, plus unrelated distractors. A record's source is given by its ID prefix (`S1-`, `S2-`, `S3-`).
-
-For each S1 entity we must output the list of matching S2/S3 IDs. The list may be empty.
-
-**Metric: macro F0.5.** F0.5 is computed per S1 entity and then averaged over all S1 entities:
-
-```
-F0.5 = 1.25 × Precision × Recall / (0.25 × Precision + Recall)
-```
-
-Precision counts twice as much as recall, because merging two different businesses is worse than missing a link.
-- An entity with matches scores **0** if we predict nothing.
-- A true singleton (no matches) scores **1** if we predict nothing, and **0** if we predict anything.
-
-**Deliverables:**
-- `output/matching_results.tsv`: the only file scored on the leaderboard.
-- `output/candidate_pairs.tsv`: the exact candidate set the final model scored. It is audited for blocking quality.
-
-**Rules:**
-- No external data or lookup services (no geocoding, no business registries, no entity-resolution APIs).
-- The final model must be MIT or Apache 2.0 licensed, with at most 8B parameters.
-- Country is an open set, and every test S1 entity (France included) must get a row.
-
-## 2. What the data actually looks like
-
-These are measured on the full training set before any modelling. They drive every design decision below.
+## 2. What the data looks like
 
 | Fact | Value | Consequence |
 |---|---|---|
-| Train size | 2.2M S1, 10.3M S2+S3 (US 60%, India 40%) | Every-pair comparison (~2×10¹³ pairs) is impossible, so we need blocking |
-| Test size | 1.73M S1, 10.0M S2+S3; **France is 15% of S1** and absent from train | Features must be language-agnostic, and France needs a label-free decision rule |
-| **Each S2/S3 record matches at most one S1** | 7.64M links, **no ID reused** | **The key structural fact** (§3) |
-| Share of S2/S3 records that match some S1 | ~74% | Most records are real matches; the rest are hard distractors |
-| Singletons (S1 with no match) | **only 5.6%** | Recall matters: an entity with matches scores 0 if we predict nothing |
-| Matches per S1 | mean 3.5, max 11 | Each prediction is a set, not a single pick |
-| Empty addresses in S2/S3 | ~3% | Name-only matching has to work too |
+| Train | 2.2M S1, 10.3M S2+S3; US 60%, India 40% | Comparing every pair is impossible, so blocking is needed |
+| Test | 1,732,544 S1, 9,969,589 S2/S3; **France is 15% of S1 and absent from train** | Features must be language-neutral; France needs a label-free decision rule |
+| **Each S2/S3 record matches at most one S1** | 7.64M links, no ID reused | The key structural fact (§3) |
+| Singletons | 5.6% of S1 | Recall matters: an entity with matches scores 0 if left empty |
+| Matches per S1 | mean 3.5, max 11 | Each prediction is a set |
+| S2+S3 records per S1 | train 4.68; test US 5.76, India 5.82, France 5.53 | **Test S1 appears to be missing ~19% of entities (~15% in France)**. Their S2/S3 records remain as look-alike "orphan" groups with no true S1 (§4.2) |
 
-**Noise patterns seen in real ground-truth groups:**
-
+**Noise seen in real ground-truth groups:**
 - **Names:**
-  - legal suffixes moved, added or dropped: `L.L.C. Herter Federal Chesapeake`, `Private Gajanand Chitfund Limited`
-  - OCR-style errors: `6eneral Printing W0rldwide`
-  - typos: `Raevn LLC`, `Asdsociataes`
-  - doubled tokens: `Nagaya Nagaya Hospitals`
-  - handles and domains: `@adxhennessy`, `#elypediatric`, `Elypediatricdentistry.Com`
-  - aliases: `Belozeta f/k/a Little Auto Body`
-  - **native scripts**: `ஏஸ் எஸ்டேட் பிரைவேட் லிமிடெட்` is *Ace Estate Private Limited*. Some names went English → Indic script → Latin and come out as `vijy teknoloji` for *Vijay Technology*, or `praim kmsltemsi` for *Prime Consultancy*.
-  - **completely unrelated brand names** (`Lumwex`, `Drexvio`) that match **only on address**
+  - legal forms moved or dropped (`Herter Federal Chesapeake`, `Gajanand Chitfund`)
+  - OCR digits (`6eneral`, `W0rldwide`), typos (`Raevn LLC`, `Asdsociataes`), doubled tokens (`Nagaya Nagaya`)
+  - handles and domains (`@adxhennessy`, `#elypediatric`), aliases (`Belozeta f/k/a`)
+  - native scripts (`ஏஸ் எஸ்டேட்`, `हरियाणा`)
+  - unrelated brand names that match only on address (`Lumwex`, `Drexvio`)
 - **Addresses:**
-  - abbreviations (`LN`, `RD`, `R.` = rue, `Bd.`) and state codes against full names
-  - reordered components (`OH, Columbus, 5559 Orville Avenue`)
-  - missing house numbers, `<NULL>`, `N/A` and empty fields
-  - city variants (`CITY OF MENOMONIE`, `COLUMUS CDP`), and French départements in place of regions
-  - native-script state names (`हरियाणा`)
+  - abbreviations, reordered parts (`OH, Columbus, … Orville Avenue`), missing numbers
+  - city variants (`CITY OF MENOMONIE`, `COLUMUS CDP`)
+  - French départements in place of regions
 
-## 3. The approach
+## 3. Architecture
 
-```
- raw TSVs ──► 0. normalize ──► 1. blocking ──► 2. pair features ──► 3. LightGBM ──► 4. assignment ──► TSVs
-             (names, addrs,    (5 sparse       (41 features:        (P(same       (1 S1 per target,
-              phonetic key)     channels +      strings, numbers,    business))    expected-F0.5 cut)
-                                LR prefilter,   competition context)
-                                top-8 per target)
-```
+**The central idea: flip the problem.** Since each S2/S3 record ("target") belongs to at most one S1, we decide for each target *which single S1 it is, or none*, then group the answers by S1.
+- A target can never be shared by two look-alike S1s, which is the costliest F0.5 error.
+- It also lets the model compare a candidate with the target's other candidates.
 
-### The central idea: flip the problem around
-The task is phrased as "for each S1 entity, find its matches". The data says **each S2/S3 record ("target") belongs to at most one S1**. So we solve the equivalent problem: *for each target, which single S1 is it, or is it none?* The per-target picks are then grouped by S1.
-
-- It turns a set-prediction problem into ~10M small **pick-one-or-none** decisions, which a classifier handles well.
-- **"At most one S1 per target" is enforced by construction.** Sharing a target between two look-alike S1s is exactly the false-merge error that F0.5 punishes most, and the flip removes it entirely.
-- The model can use **competition features**: how this candidate compares with the target's other candidates. "Close, but another S1 fits better" is often the deciding signal.
-
-### Stage 0: Normalization (`normalize.py`, run by `prep.py`)
-- **Names:**
-  - lowercase, transliterate to ASCII (`anyascii`, covering accents and Indic scripts), strip URLs, TLDs (`.com`, `.c0m`, `.co.in`, `.fr`…), `@`/`#` handles and alias markers (`f/k/a`, `dba`)
-  - fix OCR digits inside words (`0→o`, `1→l`, `6→g`, `5→s`…), `&`→`and`, drop punctuation, collapse repeated tokens
-  - remove legal forms and honorifics for US, India and France (`llc`, `inc`, `pvt`, `ltd`, `sarl`, `sas`, `sci`, `eurl`, `m/s`, `sri`…). The legal form is kept as a separate value for the legal-agreement feature.
-  - output three forms: tokens, **compact** (no spaces, which matches glued domains and handles), and **phonetic skeleton**
-- **Phonetic skeleton:** a consonant key tuned on the observed transliteration noise.
-  - Rules: `ph→f`, `x→ks`, `sh→s`, `c(e/i)→s`, other `c/ch/q→k`, `j/g→k`, `v/w→b`, `d→t`, `m→n`, vowels and `h`/`y` dropped, doubled letters collapsed.
-  - With it, `praim kmsltemsi` and `prime consultancy` both become `prn knsltns`, and `vijy teknoloji` and `Vijay Technology` both become `bk tknlk`.
-  - Legal words are also matched by skeleton, so transliterated `piraivet` and `limitet` are recognised as *private* and *limited*.
-- **Addresses:**
-  - expand abbreviations with a per-country table (US, India, France) and generic rules for any other country; map directions to short forms
-  - map US state names to codes, drop filler (`city`, `cdp`, `<null>`, `n/a`, unit/suite/flat words)
-  - split each address into **number tokens** (house, unit, zip/PIN; leading zeros stripped) and **street/locality words**
-
-Country only selects an abbreviation table. It is never used as a hard filter, so unseen countries fall back to the generic rules.
-
-### Stage 1: Blocking (`blocking.py`)
-Blocking runs **per country**, since matches never cross countries. Each **channel** turns records into sparse IDF-weighted feature vectors, and a multithreaded sparse top-K matrix product (`sparse_dot_topn`) finds each target's nearest S1 records, 10 per channel:
-
-| Channel | Features | Catches | Recall alone, US / India |
-|---|---|---|---|
-| `addr_key` | house number × street word, street-word bigrams | rebranded names, garbled names | 89.3% / 82.1% |
-| `mix_key` | phonetic name token × address word, and × house number | generic names, sparse addresses (`vijy teknoloji` + Ghaziabad + `343`) | 86.2% / 83.4% |
-| `name_ngram` | TF-IDF over rare character 4-grams of the compact name | typos, glued names, handles | 72.7% / 58.8% |
-| `name_key` | rare name tokens, token bigrams, compact prefix | near-exact names | 68.6% / 56.7% |
-| `phon_key` | phonetic tokens, bigrams, whole skeleton | transliterated names | 63.5% / 46.9% |
-| **union** (~34 S1 candidates per target) | | | **98.9% / 96.7%** |
-
-Keys shared by more than 200 S1 records, and 4-grams found in more than 0.2% of names, are dropped. They carry almost no identity information, and dropping them keeps the sparse products fast.
-
-**Prefilter.** The union is re-ranked by a **logistic regression** fitted on a 40k-target sample per training country (2.76M pairs). Its inputs are the five channel scores plus two fast RapidFuzz token-set ratios (name, address):
+**Test time:**
 
 ```
-score = −12.02 + 1.20·name_ngram + 0.68·phon_key + 2.19·mix_key − 0.62·name_key + 4.50·addr_key
-        + 4.73·pf_name + 4.11·pf_addr
+ Test TSVs (S1 1,732,544 · S2/S3 9,969,589 · US, India, France)
+   │
+ ① Normalize          names → tokens, compact form, phonetic skeleton, legal form;
+   │                   addresses → number tokens + street words (per-country abbreviation tables)
+ ② Blocking           per country: 5 sparse IDF channels, top 10 each → logistic-regression prefilter
+   │                   → top 8 S1 per target (79,748,463 pairs)
+ ③ Pair features      41 per pair: name/address similarity, numbers, channel scores, competition
+ ④ Stage-1 LightGBM   p1 for every pair
+   │                   pairs with p1 < 0.01 keep p1; the 8,391,628 "in-play" pairs go on
+ ⑤ Cross-encoder      fine-tuned multilingual-e5-small reads both records' raw "name | address" → ce
+ ⑥ Stage-2 features   35: group/sibling agreement, name rarity, ce, address crowding, name IDF
+ ⑦ Stage-2 LightGBM   p2
+ ⑧ Rescue lane        (US, India) targets whose best p2 < 0.7 → dense e5 top-5 S1s that blocking missed
+   │                   → cross-encoder → rescue LightGBM → merged with p2
+ ⑨ Assignment         best S1 per target if p ≥ 0.7; per S1, the expected-F0.5-optimal subset (empty competes)
+   ▼
+ output/matching_results.tsv, output/candidate_pairs.tsv (= top-8 candidates + scored rescue candidates)
 ```
 
-We keep the **top 8 S1s per target** (`K_FINAL`), which retains **99.75%** of the true pairs the union found. Those 8 per target are exactly what the model scores, and exactly what `candidate_pairs.tsv` reports after regrouping by S1.
+**Training and validation: a test-like simulation.**
 
-### Stage 2: Pair features (`features.py`)
-There are **41 features** per (target, S1) pair. String similarities use vectorized RapidFuzz `cpdist`; set overlaps and context features use polars.
+```
+ Train TSVs (US, India, with ground truth)
+   │
+ Ⓐ Drop a fixed random 19% of S1 (seed 123) BEFORE blocking, so train looks like test
+ Ⓑ Hold out 2% of S1 (35,724 remain after the drop) and every target that could link to them: validation only
+ ④ Stage-1 scores out-of-fold: two models on hash-split halves of the targets
+ Ⓒ In-play training pairs split in two halves by hash:
+     half A (~1.2M pairs)     → fine-tune the cross-encoder ⑤
+     half B (1,162,980 pairs) → fit stage 2 ⑦ and the rescue model ⑧; thresholds tuned on Ⓑ
+```
 
-- **Name:**
-  - `ratio`, `token_set_ratio`, `token_sort_ratio`, `partial_ratio` on clean names
-  - `ratio`, `partial_ratio` and Jaro-Winkler on compact names
-  - `ratio` and `token_set_ratio` on phonetic skeletons
-  - token overlap count and Jaccard, legal-form agreement, name lengths, token count
-- **Address:** `ratio`, `token_set_ratio` and `partial_ratio`; shared numbers and number Jaccard; whether the first number matches; street-word overlap and Jaccard; US state agreement; empty-address and has-number flags
-- **Retrieval:** all five channel scores, plus the prefilter score, rank and its two similarity inputs
-- **Competition context:**
-  - gap to the target's best candidate on prefilter score, name similarity and address similarity
-  - number of candidates
-  - `s1_top1_count`: how many targets rank this S1 first (real entities attract several records)
-- **Source:** S2 or S3, since the two sources have different noise styles (S3 uses more handles and domains)
+## 4. Components and why each exists
 
-Country is deliberately **not** a feature. France has no labels, so the model has to rely on language-neutral similarity.
+### 4.1 Candidate generation (① ②)
 
-### Stage 3: Model (`train.py`)
-- A **LightGBM** binary classifier estimates P(target and S1 are the same business).
-- Hyperparameters: `num_leaves=127`, `learning_rate=0.08`, `min_data_in_leaf=100`, feature and bagging fraction 0.8, `lambda_l2=1`, seed 42.
-- Training data: **12.0M candidate pairs (1.09M positive)** from 1.5M training targets. A hash-split 10% of those targets is used for early stopping.
-- Result: the best iteration was 1,469 of the 1,500-round cap (early stopping never triggered), with holdout log loss **0.0138**.
+- **Normalization** (`normalize.py`, `prep.py`):
+  - Lowercase, transliterate to ASCII (`anyascii`), and strip URLs, TLDs, handles and alias markers.
+  - Fix OCR digits inside words, and remove legal forms (kept separately for a legal-agreement feature).
+  - Build a **phonetic skeleton**: a consonant key tuned on the observed transliteration noise.
+  - Split addresses into number tokens and street words.
+  - Country only selects an abbreviation table, so unseen countries fall back to generic rules.
+- **Blocking** (`blocking.py`) runs per country, with five sparse channels:
 
-### Stage 4: Decisions (`assign.py`)
-1. Each target keeps only its **highest-probability S1**.
-2. The link is accepted if `p ≥ threshold`. The threshold is tuned on validation macro F0.5 and stored in `work/decision.json`: 0.3, with the expected-F0.5 cut on.
-3. For each S1, the accepted targets are sorted by p, and we keep the prefix that maximizes the **plug-in expected F0.5** `1.25·TP / (1.25·TP + 0.25·FN + FP)`, with TP, FP and FN estimated from the probabilities. **The empty prediction competes too**, with expected score ∏(1−p). Singletons are therefore handled by the same rule, with no special case.
-
-### France (no training labels)
-- French normalization: `r.`→`rue`, `bd`, `av`, `imp`, `st`→`saint`, and legal forms `sarl`/`sas`/`sasu`/`sci`/`eurl`/`snc`/`selarl`.
-- The model uses only language-neutral features.
-- Countries unseen in training get a **more cautious threshold, 0.6** (`UNSEEN_THRESHOLD` in `run.py`), instead of the tuned 0.3. On validation, macro F0.5 is flat for thresholds from 0.2 to 0.6 (0.9622–0.9624). So 0.6 costs almost nothing if the model is well calibrated on France, and it guards against overconfident false merges if it is not.
-- **Label-free sanity checks on test:**
-  - France's predictions have the same shape as the training countries' (table below).
-  - France's probabilities are very confident. Moving its threshold from 0.3 to 0.8 changes fewer than 2% of its links.
-  - A manual spot check of sampled France groups found them almost all correct: domains, accents, `R.`/`Rue`/`Bd.`, `S.A.R.L.`, reordered words, département in place of region. One likely false merge was a generic-name look-alike on a different street.
-
-  | Test predictions | Entities with a match | Links per entity |
+  | Channel | Keys | Catches |
   |---|---|---|
-  | France | 95.4% | 3.48 |
-  | US | 94.5% | 3.30 |
-  | India | 94.3% | 3.23 |
+  | `addr_key` | house number × street word | rebrands |
+  | `mix_key` | phonetic name token × address word or number | generic names |
+  | `name_ngram` | character 4-grams of the compact name | typos, glued names |
+  | `name_key` | name tokens and token pairs | near-exact names |
+  | `phon_key` | phonetic tokens | transliterations |
 
-## 4. Why this design
+  - The union recall is 98.9% (US) and 96.7% (India).
+  - A logistic regression over the channel scores and two fuzzy similarities keeps the top 8 per target, retaining 99.75% of the union's true pairs. A plain sum of the scores would lose 9–13%.
 
-**Why flip to per-target decisions?**
-- The data guarantees each target has at most one S1.
-- Enforcing that removes a whole class of false merges for free, and it matches the metric's precision focus.
-- An S1-centric approach would have to decide set membership for up to 11 records at once, with no such guarantee.
+### 4.2 The test-like simulation (Ⓐ–Ⓒ)
 
-**Why several cheap sparse channels rather than one embedding model?**
-- The error analysis showed *different* matches fail for *different* reasons.
-- Rebranded names are only findable by address. Transliterated names are only findable phonetically. Generic names need name × location keys.
-- Each channel is exact, CPU-only and explainable, and their union reaches ~99% (US) and ~97% (India) recall.
-- The ablation (§5) shows every channel adds recall the others miss.
-- A single dense embedding would blur these distinct signals, cost GPU hours on 22M records, and struggle with numbers such as house numbers, which are among the strongest evidence.
+- **What the data showed:** the S2+S3-per-S1 counts (§2) imply test S1 lacks ~19% of entities. For their orphaned records, the best look-alike S1 ranks first with no competitor.
+- **Why it mattered:** a stage-2 model trained on complete data improved plain validation by +0.010 but lost 0.001 on the leaderboard.
+- **The fix:** the cross-encoder, stage 2 and the rescue model are trained and tuned with 19% of S1 removed *before* blocking (`faithful_sim.py`). The stage-1 models use the earlier version, which removes the same S1s *after* blocking (`train.apply_drop`). That earlier version left 77% of targets with fewer than 8 candidates, a tell that test (99.99% have exactly 8) never shows, so it no longer serves as the yardstick.
+- **How well it tracks the leaderboard:** closely for US and India. The remaining gap is attributed to France, which has no labels.
 
-**Why a learned prefilter before the model?**
-- The union has ~34 candidates per target, i.e. ~350M pairs.
-- A 7-feature logistic regression cuts that to 8 per target (~80M pairs) while losing only ~0.25% of reachable matches. That makes the feature and model stages about 4× cheaper.
-- A plain sum of channel scores loses **9–13%** of true pairs at the same cut (US 9.1%, India 12.7%), so learning the weights matters.
+### 4.3 Scoring (③–⑦)
 
-**Why LightGBM on hand-built similarity features?**
-- Name and address signals interact non-linearly. For example, a weak name with a perfect address and matching house number is a match, while a strong name with no address depends on how generic the name is. Gradient-boosted trees learn these interactions well from millions of labels.
-- It is fast, uses no GPU, and is MIT-licensed, far inside the 8B-parameter limit.
-- A fine-tuned transformer cross-encoder might add a little on top. Within a 72-hour hackathon it is not the best use of time, and the precision is already 0.98.
+- **Stage-1 LightGBM** (`features.py`, `train.py`):
+  - 41 features: name similarities (plain, compact, phonetic), address similarities and number overlap, channel scores, and competition features (gap to the target's best candidate, candidate count, how many targets rank this S1 first).
+  - Country is deliberately **not** a feature, so France is judged on language-neutral evidence.
+  - The two out-of-fold models are trained with the 19% drop applied after blocking (§4.2); fold 0 scores test.
+- **In-play cut** (p1 ≥ 0.01) keeps 8.4M of 79.7M test pairs. That keeps the cross-encoder affordable (~50 min on an 8 GB GPU) and loses very few true matches.
+- **Cross-encoder** (`ce_pilot.py`, `ce_v5.py`):
+  - `intfloat/multilingual-e5-small` (MIT, 118M parameters) with a 1-logit head, fine-tuned on half-A pairs.
+  - Settings: 9,212 steps, batch 128, lr 5e-5, bf16, max 128 tokens.
+  - It reads both records' raw text together, so it can judge rebrands and which word identifies a business.
+  - This is the largest single gain: simulation 0.9691 → 0.9849, leaderboard 0.955 → 0.978.
+- **Stage-2 LightGBM** (`stage2.py`, `ce_v8.py`, `ce_v9.py`), 63 leaves, lr 0.05, fit on half B. Its 35 features:
+  - stage-1 standing and group context: siblings agreeing on address or number, the strength of the S1's group and of any competing group
+  - name rarity
+  - the cross-encoder score and its standing among the target's candidates
+  - address crowding: how many S1s share an address (13% of France S1s share an exact address, against ~5% in US/India)
+  - IDF-weighted name overlap
 
-**Why expected-F0.5 subset selection?**
-- The metric is per entity, so the right number of links depends on that entity's probabilities.
-- A single global threshold can't express "stop adding links once the marginal link lowers this entity's expected F0.5".
-- The plug-in optimizer does exactly that, and it covers singletons with the same rule.
-- Measured gain over the best plain threshold: 0.9624 against 0.9610. It is also robust to the threshold choice (§5).
+### 4.4 Rescue lane (⑧, `dense_probe.py`, `dense_rescue.py`)
 
-**Why validate like this?**
-- An earlier version of this repo was validated on 2k S1 records against only ~20k random distractors. That scored 0.88, but real retrieval faces ~10M records with thousands of look-alikes, so the number was far too optimistic. That version has been replaced entirely.
-- Here, validation uses the **full-density** candidate set:
-  - 2% of S1 entities (43,948) are held out.
-  - Every target that has a held-out S1 among its candidates, or is truly linked to one (1.53M targets), is excluded from training.
-  - Those targets are scored against *all* their candidates, including non-held-out S1s, so the pick-one competition is the real one.
-  - Macro F0.5 is computed over the held-out entities with the official formula (`metrics.py`).
+- **Why:** blocking is the recall cap, worst in India (96.7%), where it finds different neighbours than dense embeddings.
+- **How:**
+  - For targets whose best stage-2 score is below 0.7, off-the-shelf e5-small embeddings retrieve the 5 nearest S1s of the country that blocking did not return.
+  - The fine-tuned cross-encoder scores them, and a 12-feature LightGBM (trained on half B) gives the final probability.
+  - Those probabilities join the stage-2 scores before assignment, so a rescued S1 wins only if it beats the target's best existing candidate.
+- **Retrieval gain:** sampled India targets go from 96.5% of true matches retrieved to 98.7%.
+- **Final scope:**
+  - The final submission applies the lane to **US and India only**.
+  - With it also applied to France, the public score was 0.981712 against 0.98188. France has no labels to tune the lane on.
+
+### 4.5 Decisions (⑨, `assign.py`)
+
+- Each target keeps its highest-probability S1 if p ≥ 0.7, the threshold tuned in the simulation.
+- For each S1, the accepted targets are sorted by p, and we keep the prefix that maximizes the plug-in expected F0.5. The empty set competes with expected score ∏(1−p), so singletons need no special case.
+- Countries unseen in training get a threshold of at least 0.6 (`UNSEEN_THRESHOLD`); at 0.7 this doesn't bind.
 
 ## 5. Results
 
-### Blocking
+Test-like simulation (Ⓐ + Ⓑ, 35,724 held-out S1) and the public leaderboard:
 
-| | US | India |
-|---|---|---|
-| Recall of the union of 5 channels (20k-target samples, full S1 set) | 98.9% | 96.7% |
-| Share of the union's true pairs kept after the top-8 prefilter | 99.75% | 99.75% |
-| **Candidate recall ceiling on held-out validation** | **98.5%** | **96.5%** |
-
-| | Train | Test |
-|---|---|---|
-| Candidate pairs (≤ 8 per target) | 82,552,209 | 79,748,463 |
-| Average candidates per S1 entity | 37.4 (validation) | 46.0 |
-| S1 entities with no candidates | — | 65 |
-
-**Channel ablation** (union recall with one channel removed):
-
-| Removed | none | `addr_key` | `mix_key` | `name_ngram` | `name_key` | `phon_key` |
-|---|---|---|---|---|---|---|
-| US | 98.90% | 94.72% | 97.55% | 98.41% | 98.59% | 98.61% |
-| India | 96.65% | 89.48% | 92.99% | 94.55% | 94.74% | 94.65% |
-
-### Matching
-Held-out validation at full density: 43,948 S1 entities and their 1.53M candidate targets, none of which were used in training.
-
-| Metric | Overall | US | India |
+| Version | Change | Simulation F0.5 | Leaderboard |
 |---|---|---|---|
-| **Macro F0.5** | **0.9624** | **0.9659** | **0.9573** |
-| Macro precision | 0.9804 | 0.9820 | 0.9781 |
-| Macro recall | 0.9243 | 0.9319 | 0.9131 |
-| Singleton accuracy | 0.9385 | 0.9460 | 0.9274 |
-| Candidate recall ceiling | 0.9771 | 0.9854 | 0.9647 |
+| v2 | stage-1 pipeline (①–④, ⑨) | 0.9604 | 0.952 |
+| v4 | + stage 2, trained under Ⓐ | 0.9688 | 0.955 |
+| v5 | + cross-encoder | 0.9849 | 0.978 |
+| v9 | + address-crowding and name-IDF features | 0.9857 | 0.979 |
+| **v10** | **+ rescue lane (US, India)** | **0.9865** (US 0.9877, India 0.9848) | **0.98188** |
 
-**Decision rule sweep** (macro F0.5 overall):
+**Final test output:**
+- 1,632,759 of 1,732,544 S1 have matches (99,785 empty).
+- Links: US 2,241,749, India 2,718,929, France 873,741.
+- The candidate file holds the 79.7M top-8 pairs plus the scored US/India rescue candidates. Every match is inside it.
 
-| Threshold | 0.2 | 0.3 | 0.4 | 0.5 | 0.6 | 0.7 | 0.8 |
-|---|---|---|---|---|---|---|---|
-| Threshold only | 0.9431 | 0.9516 | 0.9567 | 0.9597 | 0.9610 | 0.9604 | 0.9585 |
-| + expected-F0.5 cut | 0.9624 | **0.9624** | 0.9623 | 0.9624 | 0.9622 | 0.9610 | 0.9585 |
+**Alternatives tested for the cross-encoder** (identical stage 2; simulation F0.5):
 
-**Top features by gain:**
-- `pf_rank` and `pf_gap`: the candidate's standing among its target's candidates
-- `num_jac`: overlap of address numbers
-- `pf_score` and `t_has_num`
-- `k_ratio`: similarity of the phonetic skeletons
-- `pf_addr`, `legal_eq`, `c_jw`, `n_partial`, `num_first_eq`, `state_eq`, `addr_word_jac`, `s1_top1_count`
-
-### Test predictions (submitted)
-
-| | Value |
+| Scorer | F0.5 |
 |---|---|
-| S1 rows | 1,732,544 (one per test S1) |
-| Rows with matches / empty | 1,638,626 / 93,918 (5.4% predicted singletons; the train rate is 5.6%) |
-| Total links | 5,707,868 |
-| Thresholds | US 0.3, India 0.3, France 0.6 |
-| Official validator (`--check-ids`) | **PASS** |
-
-A backup of the earlier variant (France threshold 0.80, chosen by an acceptance-rate heuristic that was later replaced) is kept in `work/output_v1_fr080/`. It also passes the validator.
+| Fine-tuned cross-encoder (used) | **0.9857** |
+| Fine-tuned bi-encoder | 0.9837 |
+| Off-the-shelf e5 embeddings | 0.9722 |
+| Character-3-gram VAE | 0.9719 |
+| TF-IDF | 0.9719 |
+| No text model | 0.9715 |
 
 ## 6. Reproducing
 
-**Requirements:**
-- Python 3.12
-- ~16 GB RAM (peak ~10 GB during blocking)
-- a multi-core CPU (developed on 16 threads); no GPU
+**Environment** (what we used):
+- Windows 11, Python 3.12, 16-thread CPU, 16 GB RAM
+- NVIDIA RTX 5060 Laptop GPU (8 GB, CUDA 12.8)
+- Internet once, to download `intfloat/multilingual-e5-small` from Hugging Face. Afterwards set `HF_HUB_OFFLINE=1`.
+- Run one heavy step at a time: blocking peaks at ~10 GB RAM, and out-of-memory kills are silent.
+
+**Paths** are relative to this folder:
+- `ER_DATA_DIR`: the folder containing `train/` and `test/`, default `Dataset/`
+- `ER_WORK_DIR`: intermediate files, default `work/`
+- `ER_OUTPUT_DIR`: default `output/`
+
+Every step caches its outputs and skips work already done.
 
 ```powershell
-# Python 3.12 (Windows install manager; on Linux/macOS use your package manager)
-py install 3.12
 py -V:3.12 -m venv .venv
 .venv\Scripts\python -m pip install -r requirements.txt       # Linux/macOS: .venv/bin/python
 
-# 1. Train split: normalize, block, fit prefilter, train LightGBM, validate, tune the threshold
-.venv\Scripts\python src\run.py --split train --stage all
+# 1. Normalize and block both splits (~35 min each; train blocking also fits work\prefilter.json)
+.venv\Scripts\python src\run.py --split train --stage prep
+.venv\Scripts\python src\run.py --split train --stage block
+.venv\Scripts\python src\run.py --split test  --stage prep
+.venv\Scripts\python src\run.py --split test  --stage block
 
-# 2. Test split: normalize, block, predict, write output\matching_results.tsv + output\candidate_pairs.tsv
-.venv\Scripts\python src\run.py --split test --stage all
+# 2. Stage 1 out-of-fold under the 19% drop, plus an interim stage 2 (~50 min)
+#    -> work\stage1_fold0.txt, stage1_fold1.txt, stage2.txt, decision2.json
+.venv\Scripts\python src\run.py --split train --stage stage2
+copy work\stage1_fold0.txt work\model.txt
 
-# 3. Validate the format (official script; stdlib only)
-python student_resource\utils\validate_submission.py --matching output\matching_results.tsv `
-    --candidate output\candidate_pairs.tsv --test-dir Dataset\test --check-ids
+# 3. Stage-1 scores on test (~45 min) -> work\test\pred.parquet (also writes an interim output\)
+.venv\Scripts\python src\run.py --split test --stage predict
 
-# 4. Build the final package
-.venv\Scripts\python src\package.py --team aid                 # -> aid_submission.zip
+# 4. Test-like simulation: drop 19% of train S1 before blocking, re-score stage 1 (~1.5 h)
+.venv\Scripts\python src\faithful_sim.py
+
+# 5. Cross-encoder: fine-tune on half A, score half B + validation (~1 h, GPU)
+.venv\Scripts\python src\ce_pilot.py prep train score
+
+# 6. Stage 2 with the cross-encoder, and cross-encoder scores for all in-play test pairs (~1 h, GPU)
+.venv\Scripts\python src\ce_v5.py fit score
+
+# 7. Final stage 2 (35 features) -> work\stage2_v9.txt, work\test\pred2_v9.parquet (~15 min)
+.venv\Scripts\python src\ce_v9.py fit write
+
+# 8. Rescue lane (~4 h, GPU) -> work\output_v10_usin\ (final) and work\output_v10_dense\ (France included)
+.venv\Scripts\python src\dense_rescue.py
+
+# 9. Final output, then the official validator (from the organisers' student_resource\utils\)
+copy work\output_v10_usin\matching_results.tsv output\
+copy work\output_v10_usin\candidate_pairs.tsv output\
+python validate_submission.py --matching output\matching_results.tsv --candidate output\candidate_pairs.tsv `
+    --test-dir <data>\test --check-ids
 ```
 
-- **The train run must come before the test run.** It produces the artifacts the test run uses: `work/prefilter.json` (prefilter weights), `work/model.txt` (LightGBM model) and `work/decision.json` (threshold and rule).
-- **Individual stages:** `--stage prep | block | train | predict`. `train` applies to `--split train` and `predict` to `--split test`.
-- **Caching:** each stage skips work whose output already exists in `work/`. Delete a file to recompute it. For example, delete `work/test/pred.parquet` after retraining the model.
-- **Paths** are relative to the folder that contains `src/`. They can be overridden with environment variables:
-  - `ER_DATA_DIR`: folder containing `train/` and `test/`; default `Dataset/`
-  - `ER_WORK_DIR`: intermediate files; default `work/`
-  - `ER_OUTPUT_DIR`: default `output/`
-- **From the submission zip:** run the same commands inside `code/business_entity_resolution/`, with `ER_DATA_DIR` pointing to the challenge data folder. The official validator is not part of the zip; it ships in the organisers' `student_resource/utils/`.
-- **Determinism:** fixed seeds (sampling, validation split, LightGBM) make reruns reproducible up to multithreading order.
+**Notes:**
+- In this package every script is in `src/`. In our repository, steps 4–8 live in `tools/`.
+- Seeds are fixed for sampling, splits, LightGBM and torch, so reruns reproduce the results up to multithreading and GPU nondeterminism.
 
-**Measured runtimes** (16-thread laptop CPU):
-
-| Stage | Train split | Test split |
-|---|---|---|
-| Normalize (`prep`) | 1.5 min | 1.3 min |
-| Blocking (incl. fitting the prefilter on train) | 35 min | 37 min (France 4, India 20, US 13) |
-| Training and validation | 15 min | — |
-| Prediction and writing the TSVs | — | 34 min + ~8 min |
-| **Total** | **~52 min** | **~80 min** |
-
-## 7. Submitting
-
-1. **Leaderboard:** upload **`output/matching_results.tsv`** (96 MB) in the portal. It is the only file that is scored.
-2. **Final package:** submit **`aid_submission.zip`** (484 MB, mostly the 1 GB candidate file):
-
-```
-aid_submission.zip
-├── output/
-│   ├── matching_results.tsv        # same file as the leaderboard upload
-│   └── candidate_pairs.tsv         # the top-8-per-target candidate set the model scored
-├── code/
-│   └── business_entity_resolution/
-│       ├── src/                    # all 11 pipeline modules
-│       ├── README.md               # this file
-│       └── requirements.txt        # pinned dependencies
-└── Documentation_template.md       # filled-in methodology write-up
-```
-
-3. **After any change** to outputs, code or documentation, re-run the validator and `src/package.py` before submitting.
-
-## 8. Repository layout
+## 7. Package layout
 
 ```
 src/
-  config.py      paths (env-overridable) and constants: K per channel (10), K_FINAL (8), key-frequency cap (200)
-  data_io.py     TSV reading and writing (tab-separated, all strings, empty kept as "", deduplicated ID lists)
-  normalize.py   name/address normalization, legal forms, phonetic skeleton
-  prep.py        stage 0: normalize and cache to parquet
-  blocking.py    stage 1: 5 retrieval channels, LR prefilter, top-8 candidates
-  features.py    stage 2: 41 pair features
-  train.py       stage 3: LightGBM training, held-out validation, threshold tuning
-  assign.py      stage 4: one S1 per target, expected-F0.5 subset per S1
-  metrics.py     official macro F0.5 and candidate recall ceiling
-  run.py         end-to-end CLI; UNSEEN_THRESHOLD for countries not seen in training
-  package.py     builds <team>_submission.zip
-Dataset/                     challenge data (train/, test/); not in git (too large)
-output/                      matching_results.tsv, candidate_pairs.tsv
-work/                        intermediates (git-ignored): normalized parquet, candidates, predictions,
-                             prefilter.json, model.txt, decision.json, train.log, test.log
-student_resource/            organisers' README, blank documentation template, utils/validate_submission.py
-Documentation_template.md    filled-in methodology write-up
-requirements.txt             pinned dependencies
-aid_submission.zip           final package (git-ignored)
+  config.py        paths (env-overridable) and constants
+  data_io.py       TSV reading/writing
+  normalize.py     name/address normalization, legal forms, phonetic skeleton
+  prep.py          ① normalize and cache to parquet
+  blocking.py      ② 5 retrieval channels, prefilter, top-8 candidates
+  features.py      ③ 41 pair features
+  train.py         ④ stage-1 LightGBM, 19% drop (DROP_FRAC), held-out validation, threshold tuning
+  stage2.py        ⑥⑦ group features, out-of-fold stage 1, stage-2 LightGBM
+  assign.py        ⑨ one S1 per target, expected-F0.5 subset per S1
+  metrics.py       official macro F0.5
+  run.py           CLI for steps 1–3
+  package.py       builds aid_submission.zip
+  faithful_sim.py  Ⓐ the test-like simulation (drop before blocking)
+  ce_pilot.py      ⑤ cross-encoder fine-tuning and scoring (half A / half B split)
+  ce_v5.py         ⑤ cross-encoder scores on test
+  ce_v8.py         ⑥ address-crowding and cross-encoder-competition features
+  ce_v9.py         ⑥⑦ name-IDF features; final stage 2 and its test scores
+  dense_probe.py   ⑧ e5 embeddings of S1 records, exact nearest-neighbour search
+  dense_rescue.py  ⑧ rescue lane: candidates, scoring, rescue model, final outputs
+README.md, requirements.txt
 ```
 
-## 9. Compliance
+## 8. Compliance
 
-- **No external data or services.** Every rule, dictionary and model parameter comes from the provided training data or from general language knowledge (abbreviation lists, legal-form lists, US state codes). No geocoding, registries or APIs are used.
-- **Dependencies** (all permissive), pinned in `requirements.txt`: numpy, scipy, scikit-learn, polars, pyarrow (BSD/MIT/Apache); LightGBM (MIT); RapidFuzz (MIT); sparse_dot_topn (Apache 2.0); anyascii (ISC). `unidecode` was deliberately avoided because it is GPL.
-- **Model:** LightGBM gradient-boosted trees (MIT), 1,469 trees × 127 leaves, about 4×10⁵ parameters, far inside the 8B limit.
-- **Country as an open set.** Nothing is filtered or one-hot encoded by country, and every test S1 entity gets a row, France included.
-- **Output rules:** tab-separated, exact headers, one row per S1, no duplicate IDs, only existing S2/S3 IDs, and matches ⊆ candidates. All of this is verified by the official validator.
+- **No external data or services.** Rules and dictionaries come from the provided training data or general language knowledge: abbreviation lists, legal forms, US state codes. No geocoding, registries or lookup APIs are used.
+- **Pretrained model:** `intfloat/multilingual-e5-small`, MIT licence, 118M parameters. Its public weights are downloaded once from Hugging Face and fine-tuned only on the provided training data; no data is looked up at run time.
+- **Other models:** three LightGBM models (stage 1, stage 2, rescue), all MIT and far below the 8B-parameter limit.
+- **Label-free test statistics:** the IDF weights of the blocking channels and of the name-IDF features are fitted on each split's own S1 records, without labels.
+- **Dependencies** (pinned in `requirements.txt`, all permissive):
+  - numpy, scipy, scikit-learn, polars, pyarrow, sparse-dot-topn, anyascii (BSD/MIT/Apache/ISC)
+  - LightGBM, RapidFuzz (MIT)
+  - torch (BSD-3)
+  - transformers, tokenizers, huggingface_hub, safetensors (Apache-2.0)
+- **Country is an open set.** Nothing is one-hot encoded by country, and every test S1 gets a row, France included.
 
-## 10. Limitations and next steps
+## 9. Limitations
 
-**Known limitations:**
-- **Recall is the remaining gap:** 0.924 achieved against a 0.977 ceiling, while precision is 0.98. Most lost recall is true links that are in the candidate set but fall below the per-entity cut.
-- **Generic names** ("Balaji Investments", "Galaxy Management") with an empty or city-only address. Hundreds of S1 records share them, which causes most blocking misses and most singleton false merges.
-- **India trails the US** (0.957 against 0.966) because of transliterated names and sparser addresses.
-- **France is unlabelled.** Its threshold is a principled but unvalidated choice (§3).
-
-**Most promising improvements** (in expected-gain order):
-1. **Second-stage group model.** Re-score each target with features of the other targets predicted for the same S1, such as shared address or house number with siblings, sibling count and runner-up S1 strength. This rescues rebranded siblings and rejects lone generic-name merges.
-2. **A learned native-script ↔ English token dictionary** from the training pairs (`பிரைவேட்`→`private`, `kmsltemsi`→`consultancy`), plus a larger `K_FINAL` (10–12) for India.
-3. **Name-frequency features**, i.e. how many S1 records share this name or skeleton, so that generic names need stronger address evidence.
-4. **More training targets** (4–5M instead of 1.5M), light hyperparameter tuning, and a separate threshold per country.
+- **France** (15% of test, no labels) is our weakest country. Leaderboard probes put it near 0.94–0.96, against ~0.986 for US+India, assuming the simulation is right for US/India. We could not find a label-free fix:
+  - Loosening France's acceptance lost ~0.035 in France's score.
+  - Tightening it (keeping only links with p ≥ 0.99) did not help, though that probe could only be read to 3 decimals.
+  - Adding rescued links cost ~0.001, and swapping between the v5 and v9 versions of France's rows changed nothing (< 0.0001).
+- **Recall is capped by retrieval,** most in India. The rescue lane recovers part of the gap.
+- **Decisions are made per target.** Clustering S2/S3 records into entities first, and then deciding per cluster whether an S1 exists, may handle the orphan groups better. It is untested.
