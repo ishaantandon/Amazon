@@ -7,7 +7,7 @@ from config import OUTPUT_DIR, ROOT
 # The final pipeline's scripts live in tools/ in this repo; the package puts all source under src/.
 # They locate src/ relative to their own file and import each other by module name, so they run there unchanged.
 PIPELINE_TOOLS = ["faithful_sim.py", "ce_pilot.py", "ce_v5.py", "ce_v8.py", "ce_v9.py", "dense_probe.py",
-                  "dense_rescue.py"]
+                  "dense_rescue.py", "france_threshold.py"]
 EXCLUDE_SRC = {"stage2_next.py"}  # abandoned experiment, never validated
 
 
